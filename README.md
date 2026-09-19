@@ -17,6 +17,14 @@ The rules are as follows:
 
 The proxy will also keep a watch dog of stale connections. If a connection is not seen for more than `watchdog_stale` seconds, the connection will be closed and removed from the list.
 
+Raw websocket payload logging is optional and disabled by default. To enable it, set
+`websocket_data_file` under `[logging]`, for example:
+
+`websocket_data_file = websocket-data.log`
+
+The file contains every payload received from and sent to the charger and upstream
+servers. Payloads may contain sensitive data, so protect the log file appropriately.
+
 
 ## Usage
 

@@ -24,6 +24,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("proxy")
+websocket_data_logger = logging.getLogger("websocket_data")
+websocket_data_logger.propagate = False
 
 class OCPP2WProxy: # Forward declaration
     pass
@@ -63,6 +65,15 @@ class OCPP2WProxy:
 
         # Insert new OCPP2WProxy instance in the (static) dict of instances.
         self.proxy_list[charger_id] = self
+
+    @staticmethod
+    def log_websocket_data(direction: str, endpoint: str, message: str):
+        """Log a raw websocket payload when data logging is enabled."""
+        websocket_data_logger.debug("%s %s: %s", direction, endpoint, message)
+
+    async def send_message(self, connection, endpoint: str, message: str):
+        self.log_websocket_data("SEND", endpoint, message)
+        await connection.send(message)
 
     async def close(self):
         """Close the charger connection and all upstream server connections."""
@@ -165,6 +176,7 @@ class OCPP2WProxy:
             while True:
                 # Wait for a message from the charger
                 message = await self.ws.recv()
+                self.log_websocket_data("RECV", f"charger/{self.charger_id}", message)
                 logger.info(f"{self.charger_id} ^ : {message}")
 
                 [message_type, message_id] = OCPP2WProxy.decode_ocpp_message(message)
@@ -172,7 +184,10 @@ class OCPP2WProxy:
                 # Calls from the charger are broadcast to every upstream server.
                 if message_type == OCPPMessageType.Call:
                     await asyncio.gather(
-                        *(connection.send(message) for connection in self.server_connections)
+                        *(
+                            self.send_message(connection, f"server/{index}", message)
+                            for index, connection in enumerate(self.server_connections)
+                        )
                     )
                 elif message_type == OCPPMessageType.CallResult or message_type == OCPPMessageType.CallError:
                     server_index = self.server_call_ids.pop(message_id, None)
@@ -180,7 +195,11 @@ class OCPP2WProxy:
                         logger.error(f"{self.charger_id} ^: Received CallResult/CallError against unknown message id {message_id}")
                     else:
                         logger.info(f"{self.charger_id} ^ : Result/Error forwarded to server {server_index}")
-                        await self.server_connections[server_index].send(message)
+                        await self.send_message(
+                            self.server_connections[server_index],
+                            f"server/{server_index}",
+                            message,
+                        )
                 else:
                     logger.error(f"{self.charger_id} ^: Unknown message type {message_type}")
         except Exception as e:
@@ -192,14 +211,15 @@ class OCPP2WProxy:
         try:
             while True:
                 message = await connection.recv()
+                self.log_websocket_data("RECV", f"server/{server_index}", message)
                 logger.info(f"{self.charger_id} v ({role}) : {message}")
 
                 [message_type, message_id] = OCPP2WProxy.decode_ocpp_message(message)
                 if message_type == OCPPMessageType.Call:
                     self.server_call_ids[message_id] = server_index
-                    await self.ws.send(message)
+                    await self.send_message(self.ws, f"charger/{self.charger_id}", message)
                 elif server_index == 0:
-                    await self.ws.send(message)
+                    await self.send_message(self.ws, f"charger/{self.charger_id}", message)
         except Exception as e:
             logger.error(f"{self.charger_id} Error in receive_{role}_messages: {e}")
 
@@ -264,8 +284,21 @@ async def main():
     logger.warning(f"Reading config from {args.config}")
     config.read(args.config)
 
+    websocket_data_file = config.get("logging", "websocket_data_file", fallback="").strip()
+    if websocket_data_file:
+        websocket_data_handler = logging.FileHandler(websocket_data_file)
+        websocket_data_handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        websocket_data_logger.addHandler(websocket_data_handler)
+        websocket_data_logger.setLevel(logging.DEBUG)
+        logger.warning(f"Logging raw websocket data to {websocket_data_file}")
+
     # Adjust log levels
     for logger_name in config["logging"]:
+        if logger_name == "websocket_data_file":
+            continue
         logger.warning(f'Setting log level for {logger_name} to {config.get("logging", logger_name)}')
         logging.getLogger(logger_name).setLevel(level=config.get("logging", logger_name))
 
