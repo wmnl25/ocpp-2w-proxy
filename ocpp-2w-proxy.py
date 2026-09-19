@@ -56,20 +56,20 @@ class OCPP2WProxy:
             logger.error(f"Charger ID '{charger_id}' is not alphanumeric")
             raise Exception("Charger ID is not alphanumeric")
 
-        # Initialize table of CSMS call ids sent to the charger in order to respond back 
-        self.primary_call_ids = set()
-        self.secondary_call_ids = set()
+        # Track each upstream call so the charger's result can be sent back to
+        # the server that originated it.
+        self.server_call_ids: dict[str, int] = {}
+        self.server_connections = []
 
         # Insert new OCPP2WProxy instance in the (static) dict of instances.
         self.proxy_list[charger_id] = self
 
     async def close(self):
-        """Close all connections to the charger and primary, secondary server"""
+        """Close the charger connection and all upstream server connections."""
         try:
             await self.ws.close()
-            await self.primary_connection.close()
-            if self.secondary_connection:
-                await self.secondary_connection.close()
+            for connection in self.server_connections:
+                await connection.close()
         except Exception as e:
             pass # Ignore exceptions
 
@@ -85,7 +85,7 @@ class OCPP2WProxy:
     async def run(self):
         """Main loop for this proxy. This is where all the magic happens."""
 
-        # Create connections to the two CSMSes.
+        # Create connections to all configured CSMSes.
         # Forward any available Authorization and User-Agent headers
         headers = {}
         if "Authorization" in self.ws.request.headers:
@@ -93,43 +93,46 @@ class OCPP2WProxy:
             logger.debug(f'Authorization header set to {headers["Authorization"]}')
         user_agent = self.ws.request.headers.get("User-Agent", None) 
         subprotocols = self.ws.request.headers.get("Sec-WebSocket-Protocol", ["ocpp1.6"])
-        primary_url = config.get("ext-server", "server") + "/" + self.charger_id
-        if config.has_option("ext-server", "secondary_server"):
-            secondary_url = config.get("ext-server", "secondary_server") + "/" + self.charger_id
+        if config.has_option("ext-server", "servers"):
+            server_urls = [
+                url.strip().rstrip("/")
+                for url in config.get("ext-server", "servers").split(",")
+                if url.strip()
+            ]
         else:
-            secondary_url = None    
+            server_urls = [config.get("ext-server", "server").strip().rstrip("/")]
+            if config.has_option("ext-server", "secondary_server"):
+                server_urls.append(
+                    config.get("ext-server", "secondary_server").strip().rstrip("/")
+                )
+
+        if not server_urls:
+            raise ValueError("At least one external server must be configured")
 
         try:
-            self.primary_connection = await websockets.connect(
-                uri=primary_url,
-                user_agent_header=user_agent,
-                additional_headers=headers,
-                subprotocols=[subprotocols],
-            )
-            logger.info(f"Connected to primary server @ {primary_url}")
-
-            # Connect to secondary server if it is enabled.
-            if secondary_url:
-                self.secondary_connection = await websockets.connect(
-                    uri=secondary_url,
-                    user_agent_header=user_agent,
-                    additional_headers=headers,
-                    subprotocols=[subprotocols],
+            for server_url in server_urls:
+                self.server_connections.append(
+                    await websockets.connect(
+                        uri=f"{server_url}/{self.charger_id}",
+                        user_agent_header=user_agent,
+                        additional_headers=headers,
+                        subprotocols=[subprotocols],
+                    )
                 )
-                logger.info(f"{self.charger_id} Connected to secondary server @ {secondary_url}")
-            else:
-                self.secondary_connection = None
-                logger.info(f"{self.charger_id} Secondary server not enabled")
-            
-            # Create tasks to handle the charger. Each task each to handle receiving messages from
-            # the charger, and the (one or two) CSMSes, and finally a watch dog task to take down
-            # connections if connection goes stale.
+            for index, server_url in enumerate(server_urls):
+                role = "primary" if index == 0 else f"secondary {index}"
+                logger.info(
+                    f"{self.charger_id} Connected to {role} server @ "
+                    f"{server_url}/{self.charger_id}"
+                )
+
+            # Create tasks to handle the charger and each configured server.
             self._last_charger_update = time.time()
-            self.tasks = []
-            self.tasks.append(asyncio.create_task(self.receive_charger_messages()))
-            self.tasks.append(asyncio.create_task(self.receive_primary_messages()))
-            if self.secondary_connection is not None:
-                self.tasks.append(asyncio.create_task(self.receive_secondary_messages()))
+            self.tasks = [asyncio.create_task(self.receive_charger_messages())]
+            self.tasks.extend(
+                asyncio.create_task(self.receive_server_messages(index))
+                for index in range(len(self.server_connections))
+            )
             #self.tasks.append(asyncio.create_task(self.watchdog()))
 
             # Wait for tasks to complete
@@ -162,68 +165,49 @@ class OCPP2WProxy:
             while True:
                 # Wait for a message from the charger
                 message = await self.ws.recv()
-                # Process the received message
                 logger.info(f"{self.charger_id} ^ : {message}")
 
-                # Now, if this is an OCPP CallResult (3) or CallError (4), we need to send it back to the 
-                # CSMS (primary or secondary) that issued the command
                 [message_type, message_id] = OCPP2WProxy.decode_ocpp_message(message)
 
-                # If it is a Call (2), we will send it to both primary and secondary (if connected)
+                # Calls from the charger are broadcast to every upstream server.
                 if message_type == OCPPMessageType.Call:
-                    await self.primary_connection.send(message)
-                    if self.secondary_connection:
-                        await self.secondary_connection.send(message)
+                    await asyncio.gather(
+                        *(connection.send(message) for connection in self.server_connections)
+                    )
                 elif message_type == OCPPMessageType.CallResult or message_type == OCPPMessageType.CallError:
-                    if message_id in self.primary_call_ids:
-                        logger.info(f"{self.charger_id} ^ : Result/Error forwarded to primary")
-                        self.primary_call_ids.remove(message_id)
-                        await self.primary_connection.send(message)
-                    elif message_id in self.secondary_call_ids:
-                        logger.info(f"{self.charger_id} ^ : Result/Error forwarded to secondary")
-                        self.secondary_call_ids.remove(message_id)
-                        await self.secondary_connection.send(message)
-                    else:
+                    server_index = self.server_call_ids.pop(message_id, None)
+                    if server_index is None:
                         logger.error(f"{self.charger_id} ^: Received CallResult/CallError against unknown message id {message_id}")
+                    else:
+                        logger.info(f"{self.charger_id} ^ : Result/Error forwarded to server {server_index}")
+                        await self.server_connections[server_index].send(message)
                 else:
                     logger.error(f"{self.charger_id} ^: Unknown message type {message_type}")
         except Exception as e:
             logger.error(f"{self.charger_id} Error in receive_charger_messages: {e}")
 
-    async def receive_primary_messages(self):
+    async def receive_server_messages(self, server_index: int):
+        connection = self.server_connections[server_index]
+        role = "primary" if server_index == 0 else f"secondary {server_index}"
         try:
             while True:
-                # Wait for a message from the primary server
-                message = await self.primary_connection.recv()
-                logger.info(f"{self.charger_id} v (prim) : {message}")
+                message = await connection.recv()
+                logger.info(f"{self.charger_id} v ({role}) : {message}")
 
                 [message_type, message_id] = OCPP2WProxy.decode_ocpp_message(message)
                 if message_type == OCPPMessageType.Call:
-                    # Record the message_id 
-                    self.primary_call_ids.add(message_id)
-
-                # Send message to the charger
-                await self.ws.send(message)
+                    self.server_call_ids[message_id] = server_index
+                    await self.ws.send(message)
+                elif server_index == 0:
+                    await self.ws.send(message)
         except Exception as e:
-            logger.error(f"{self.charger_id} Error in receive_primary_messages: {e}")
+            logger.error(f"{self.charger_id} Error in receive_{role}_messages: {e}")
+
+    async def receive_primary_messages(self):
+        await self.receive_server_messages(0)
 
     async def receive_secondary_messages(self):
-        try:
-            while True:
-                # Wait for a message from the secondary server
-                message = await self.secondary_connection.recv()
-                logger.info(f"{self.charger_id} v (sec) : {message}")
-
-                [message_type, message_id] = OCPP2WProxy.decode_ocpp_message(message)
-                if message_type == OCPPMessageType.Call:
-                    # Record the message_id 
-                    self.secondary_call_ids.add(message_id)
-                    # Send it to the charger
-                    await self.ws.send(message) 
-                # Note! We do not forward CallResults or CallErrors from the secondary server
-                # These are silently ignored.
-        except Exception as e:
-            logger.error(f"{self.charger_id} Error in receive_secondary_messages: {e}")
+        await self.receive_server_messages(1)
 
     async def watchdog(self):
         """Watch time vs. timestamp updated by receiving messages from charger."""
